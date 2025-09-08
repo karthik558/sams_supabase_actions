@@ -1,4 +1,4 @@
-name: Supabase Backup
+name: Supabase Backup (env vars)
 
 on:
   workflow_dispatch: {}
@@ -6,10 +6,18 @@ on:
 jobs:
   dump:
     runs-on: ubuntu-latest
+    env:
+      DB_HOST: ${{ secrets.DB_HOST }}
+      DB_NAME: ${{ secrets.DB_NAME }}
+      DB_USER: ${{ secrets.DB_USER }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+      DB_PORT_POOLER: ${{ secrets.DB_PORT_POOLER }}
+      DB_PORT_DIRECT: ${{ secrets.DB_PORT_DIRECT }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Postgres client + dns tools
+      - name: Install clients + tools
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql-client dnsutils netcat-traditional
@@ -17,60 +25,57 @@ jobs:
       - name: Debug DNS and ports
         run: |
           set -x
-          HOST="db.bymmvtbiohiqayyxppgr.supabase.co"
-          dig +short $HOST || true
-          nc -vz $HOST 5432 || true
-          nc -vz $HOST 6543 || true
+          dig +short "$DB_HOST" || true
+          nc -vz "$DB_HOST" "$DB_PORT_POOLER" || true
+          nc -vz "$DB_HOST" "$DB_PORT_DIRECT" || true
 
-      - name: Try direct connection
-        id: direct
-        env:
-          PGURI: ${{ secrets.SUPABASE_DB_URL }}
+      - name: Try pooler (IPv4)
+        id: try_pooler
         run: |
           set -e
-          echo "Testing DIRECT..."
-          psql "$PGURI" -c "select version();" >/dev/null
+          export PGPASSWORD="$DB_PASSWORD"
+          psql -h "$DB_HOST" -p "$DB_PORT_POOLER" -U "$DB_USER" -d "$DB_NAME" -c "select 1" >/dev/null
           echo "ok=true" >> "$GITHUB_OUTPUT"
 
-      - name: Try pooler connection (fallback)
+      - name: Try direct (fallback)
         if: ${{ failure() }}
-        id: pooler
-        env:
-          PGURI: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+        id: try_direct
         run: |
           set -e
-          echo "Testing POOLER..."
-          psql "$PGURI" -c "select version();" >/dev/null
+          export PGPASSWORD="$DB_PASSWORD"
+          psql -h "$DB_HOST" -p "$DB_PORT_DIRECT" -U "$DB_USER" -d "$DB_NAME" -c "select 1" >/dev/null
           echo "ok=true" >> "$GITHUB_OUTPUT"
 
-      - name: Pick PGURI
-        id: pickuri
+      - name: Choose working port
+        id: pick
         if: always()
         env:
-          DIRECT_OK: ${{ steps.direct.outputs.ok }}
-          POOLER_OK: ${{ steps.pooler.outputs.ok }}
-          DIRECT: ${{ secrets.SUPABASE_DB_URL }}
-          POOLER: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+          POOLER_OK: ${{ steps.try_pooler.outputs.ok }}
+          DIRECT_OK: ${{ steps.try_direct.outputs.ok }}
         run: |
-          if [ "${DIRECT_OK}" = "true" ]; then
-            echo "pguri=${DIRECT}" >> "$GITHUB_OUTPUT"
-            echo "Using DIRECT."
-          elif [ "${POOLER_OK}" = "true" ]; then
-            echo "pguri=${POOLER}" >> "$GITHUB_OUTPUT"
-            echo "Using POOLER."
+          if [ "${POOLER_OK}" = "true" ]; then
+            echo "port=${DB_PORT_POOLER}" >> "$GITHUB_OUTPUT"
+            echo "mode=pooler" >> "$GITHUB_OUTPUT"
+          elif [ "${DIRECT_OK}" = "true" ]; then
+            echo "port=${DB_PORT_DIRECT}" >> "$GITHUB_OUTPUT"
+            echo "mode=direct" >> "$GITHUB_OUTPUT"
           else
-            echo "Could not connect with either URI."
+            echo "Could not connect with pooler or direct."
             exit 1
           fi
 
-      - name: pg_dump (schema+data+RLS)
+      - name: pg_dump (schema + data + RLS)
         env:
-          PGURI: ${{ steps.pickuri.outputs.pguri }}
+          PORT: ${{ steps.pick.outputs.port }}
         run: |
           set -e
+          export PGPASSWORD="$DB_PASSWORD"
           DATE=$(date +%F)
           FILE="backup_${DATE}.dump"
-          pg_dump "$PGURI" --format=custom --no-owner --no-privileges --verbose --file="$FILE"
+          echo "Dumping from $DB_HOST:$PORT/$DB_NAME ..."
+          pg_dump -h "$DB_HOST" -p "$PORT" -U "$DB_USER" -d "$DB_NAME" \
+            --format=custom --no-owner --no-privileges --verbose \
+            -f "$FILE"
           echo "FILE=$FILE" >> $GITHUB_ENV
 
       - name: Upload artifact
