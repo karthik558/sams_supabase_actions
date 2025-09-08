@@ -2,8 +2,6 @@ name: Supabase Backup
 
 on:
   workflow_dispatch: {}
-  # schedule:
-  #   - cron: "0 2 * * *"
 
 jobs:
   dump:
@@ -11,30 +9,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Postgres client
+      - name: Install Postgres client + dns tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-client
+          sudo apt-get install -y postgresql-client dnsutils netcat-traditional
 
-      - name: Pick connection (direct → pooler)
-        id: pickuri
+      - name: Debug DNS and ports
+        run: |
+          set -x
+          HOST="db.bymmvtbiohiqayyxppgr.supabase.co"
+          dig +short $HOST || true
+          nc -vz $HOST 5432 || true
+          nc -vz $HOST 6543 || true
+
+      - name: Try direct connection
+        id: direct
         env:
+          PGURI: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -e
+          echo "Testing DIRECT..."
+          psql "$PGURI" -c "select version();" >/dev/null
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Try pooler connection (fallback)
+        if: ${{ failure() }}
+        id: pooler
+        env:
+          PGURI: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+        run: |
+          set -e
+          echo "Testing POOLER..."
+          psql "$PGURI" -c "select version();" >/dev/null
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Pick PGURI
+        id: pickuri
+        if: always()
+        env:
+          DIRECT_OK: ${{ steps.direct.outputs.ok }}
+          POOLER_OK: ${{ steps.pooler.outputs.ok }}
           DIRECT: ${{ secrets.SUPABASE_DB_URL }}
           POOLER: ${{ secrets.SUPABASE_DB_URL_POOLER }}
         run: |
-          set -e
-          if psql "$DIRECT" -c '\q' >/dev/null 2>&1; then
-            echo "pguri=$DIRECT" >> "$GITHUB_OUTPUT"
-            echo "Using direct connection."
-          elif psql "$POOLER" -c '\q' >/dev/null 2>&1; then
-            echo "pguri=$POOLER" >> "$GITHUB_OUTPUT"
-            echo "Using session pooler."
+          if [ "${DIRECT_OK}" = "true" ]; then
+            echo "pguri=${DIRECT}" >> "$GITHUB_OUTPUT"
+            echo "Using DIRECT."
+          elif [ "${POOLER_OK}" = "true" ]; then
+            echo "pguri=${POOLER}" >> "$GITHUB_OUTPUT"
+            echo "Using POOLER."
           else
-            echo "Failed to connect with both URIs."
+            echo "Could not connect with either URI."
             exit 1
           fi
 
-      - name: pg_dump
+      - name: pg_dump (schema+data+RLS)
         env:
           PGURI: ${{ steps.pickuri.outputs.pguri }}
         run: |
