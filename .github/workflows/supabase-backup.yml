@@ -1,0 +1,83 @@
+name: Supabase Backup
+
+on:
+  workflow_dispatch: {}
+  # uncomment to schedule (02:00 UTC daily)
+  # schedule:
+  #   - cron: "0 2 * * *"
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Postgres client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Choose working PGURI (direct, else pooler)
+        id: pickuri
+        env:
+          DIRECT: ${{ secrets.SUPABASE_DB_URL }}
+          POOLER: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+        run: |
+          set -e
+          echo "Trying direct connection..."
+          if psql "$DIRECT" -c '\q' >/dev/null 2>&1; then
+            echo "pguri=$DIRECT" >> "$GITHUB_OUTPUT"
+            echo "Using direct connection."
+          else
+            echo "Direct failed. Trying session pooler (IPv4)…"
+            if psql "$POOLER" -c '\q' >/dev/null 2>&1; then
+              echo "pguri=$POOLER" >> "$GITHUB_OUTPUT"
+              echo "Using session pooler."
+            else
+              echo "ERROR: Could not connect using either DIRECT or POOLER URIs."
+              exit 1
+            fi
+          fi
+
+      - name: pg_dump (schema+data+RLS)
+        env:
+          PGURI: ${{ steps.pickuri.outputs.pguri }}
+        run: |
+          set -e
+          DATE=$(date +%F)
+          FILE="backup_${DATE}.dump"
+          echo "Dumping to $FILE"
+          pg_dump "$PGURI" \
+            --format=custom \
+            --no-owner --no-privileges \
+            --verbose \
+            --file="$FILE"
+          echo "FILE=$FILE" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-backup
+          path: ${{ env.FILE }}
+          retention-days: 7
+
+      # Optional: also push to Supabase Storage if secrets are set
+      - name: Upload to Supabase Storage
+        if: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY != '' && secrets.SUPABASE_URL != '' && secrets.STORAGE_BUCKET != '' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          STORAGE_BUCKET: ${{ secrets.STORAGE_BUCKET }}
+          FILE: ${{ env.FILE }}
+        run: |
+          set -e
+          echo "Uploading $FILE to bucket $STORAGE_BUCKET ..."
+          curl -sS -X POST \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "x-upsert: true" \
+            -H "content-type: application/octet-stream" \
+            --data-binary @"$FILE" \
+            "${SUPABASE_URL}/storage/v1/object/${STORAGE_BUCKET}/${FILE}"
+          echo "Uploaded to Supabase Storage."
